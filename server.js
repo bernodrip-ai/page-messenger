@@ -3,6 +3,7 @@ const axios = require('axios');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
+const initSqlJs = require('sql.js');
 
 dotenv.config();
 
@@ -11,7 +12,8 @@ app.use(express.json({ limit: '50mb' }));
 app.use(cors());
 
 const PORT = process.env.PORT || 3001;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+
+console.log('🚀 Server starting...');
 
 // ============================================================
 // GET PAGES FROM .env
@@ -34,76 +36,110 @@ const PAGES = getPagesFromEnv();
 console.log(`📄 Loaded ${PAGES.length} pages from .env`);
 
 // ============================================================
-// DATABASE SETUP (SQLite with better-sqlite3)
+// DATABASE SETUP (sql.js - No compilation needed!)
 // ============================================================
-const Database = require('better-sqlite3');
+let db = null;
+const fs = require('fs');
 const dbPath = path.join(__dirname, 'database.db');
-const db = new Database(dbPath);
 
-// Create tables
-db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        email TEXT UNIQUE,
-        password TEXT,
-        created TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS leads (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        pageId TEXT,
-        psid TEXT,
-        name TEXT,
-        lastSync TEXT,
-        lastMessage TEXT,
-        lastMessageTime TEXT,
-        UNIQUE(pageId, psid)
-    );
-
-    CREATE TABLE IF NOT EXISTS groups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        pageId TEXT,
-        name TEXT,
-        created TEXT,
-        leads TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS saved_replies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        userId INTEGER,
-        keyword TEXT,
-        message TEXT,
-        created TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS sync_status (
-        pageId TEXT PRIMARY KEY,
-        lastSync TEXT,
-        status TEXT,
-        totalLeads INTEGER DEFAULT 0,
-        newLeads INTEGER DEFAULT 0
-    );
-`);
-
-console.log('✅ Database ready!');
-
-// ============================================================
-// DATABASE HELPER FUNCTIONS
-// ============================================================
+// Database functions
 function dbAll(sql, params = []) {
     const stmt = db.prepare(sql);
-    return stmt.all(...params);
+    stmt.bind(params);
+    const results = [];
+    while (stmt.step()) {
+        results.push(stmt.getAsObject());
+    }
+    stmt.free();
+    return results;
 }
 
 function dbGet(sql, params = []) {
     const stmt = db.prepare(sql);
-    return stmt.get(...params);
+    stmt.bind(params);
+    let result = null;
+    if (stmt.step()) {
+        result = stmt.getAsObject();
+    }
+    stmt.free();
+    return result;
 }
 
 function dbRun(sql, params = []) {
     const stmt = db.prepare(sql);
-    return stmt.run(...params);
+    stmt.bind(params);
+    stmt.step();
+    stmt.free();
+    // Save database to file
+    const data = db.export();
+    fs.writeFileSync(dbPath, Buffer.from(data));
+    return { changes: db.getRowsModified() };
+}
+
+// Initialize database
+async function initDatabase() {
+    const SQL = await initSqlJs();
+    
+    // Check if database file exists
+    let fileBuffer = null;
+    if (fs.existsSync(dbPath)) {
+        fileBuffer = fs.readFileSync(dbPath);
+    }
+    
+    // Create database
+    db = new SQL.Database(fileBuffer);
+    
+    // Create tables
+    db.run(`
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT UNIQUE,
+            password TEXT,
+            created TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pageId TEXT,
+            psid TEXT,
+            name TEXT,
+            lastSync TEXT,
+            lastMessage TEXT,
+            lastMessageTime TEXT,
+            UNIQUE(pageId, psid)
+        );
+
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pageId TEXT,
+            name TEXT,
+            created TEXT,
+            leads TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS saved_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            userId INTEGER,
+            keyword TEXT,
+            message TEXT,
+            created TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_status (
+            pageId TEXT PRIMARY KEY,
+            lastSync TEXT,
+            status TEXT,
+            totalLeads INTEGER DEFAULT 0,
+            newLeads INTEGER DEFAULT 0
+        );
+    `);
+    
+    // Save database
+    const data = db.export();
+    fs.writeFileSync(dbPath, Buffer.from(data));
+    
+    console.log('✅ Database ready!');
 }
 
 // ============================================================
@@ -240,17 +276,13 @@ app.get('/api/leads/:pageId', async (req, res) => {
         }
 
         // Save to database
-        const insertStmt = db.prepare(`
-            INSERT OR REPLACE INTO leads (pageId, psid, name, lastSync, lastMessage, lastMessageTime) 
-            VALUES (?, ?, ?, ?, ?, ?)
-        `);
-        
-        const insertMany = db.transaction((leads) => {
-            for (const lead of leads) {
-                insertStmt.run(pageId, lead.psid, lead.name, new Date().toISOString(), lead.lastMessage, lead.lastMessageTime);
-            }
-        });
-        insertMany(allLeads);
+        dbRun('DELETE FROM leads WHERE pageId = ?', [pageId]);
+        for (const lead of allLeads) {
+            dbRun(
+                'INSERT INTO leads (pageId, psid, name, lastSync, lastMessage, lastMessageTime) VALUES (?, ?, ?, ?, ?, ?)',
+                [pageId, lead.psid, lead.name, new Date().toISOString(), lead.lastMessage, lead.lastMessageTime]
+            );
+        }
 
         dbRun('INSERT OR REPLACE INTO sync_status (pageId, lastSync, status, totalLeads, newLeads) VALUES (?, ?, ?, ?, ?)',
             [pageId, new Date().toISOString(), 'completed', allLeads.length, 0]);
@@ -453,9 +485,14 @@ app.get('/', (req, res) => {
 // ============================================================
 // START SERVER
 // ============================================================
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📄 Pages: ${PAGES.length}`);
-    console.log(`📁 Frontend: ${frontendPath}`);
-    console.log(`✅ Database: ${dbPath}`);
+initDatabase().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🚀 Server running on http://localhost:${PORT}`);
+        console.log(`📄 Pages: ${PAGES.length}`);
+        console.log(`📁 Frontend: ${frontendPath}`);
+        console.log(`✅ Database: ${dbPath}`);
+    });
+}).catch(err => {
+    console.error('❌ Database init error:', err);
+    process.exit(1);
 });
