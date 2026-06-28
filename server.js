@@ -11,9 +11,10 @@ app.use(express.json({ limit: '50mb' }));
 app.use(cors());
 
 const PORT = process.env.PORT || 3001;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
 // ============================================================
-// GET PAGES FROM ENV
+// GET PAGES FROM .env
 // ============================================================
 function getPagesFromEnv() {
     const pages = [];
@@ -33,27 +34,100 @@ const PAGES = getPagesFromEnv();
 console.log(`📄 Loaded ${PAGES.length} pages from .env`);
 
 // ============================================================
-// IN-MEMORY STORAGE (No database needed!)
+// DATABASE SETUP (SQLite with better-sqlite3)
 // ============================================================
-let leads = [];
-let users = [];
-let groups = [];
-let savedReplies = [];
+const Database = require('better-sqlite3');
+const dbPath = path.join(__dirname, 'database.db');
+const db = new Database(dbPath);
+
+// Create tables
+db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        email TEXT UNIQUE,
+        password TEXT,
+        created TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pageId TEXT,
+        psid TEXT,
+        name TEXT,
+        lastSync TEXT,
+        lastMessage TEXT,
+        lastMessageTime TEXT,
+        UNIQUE(pageId, psid)
+    );
+
+    CREATE TABLE IF NOT EXISTS groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pageId TEXT,
+        name TEXT,
+        created TEXT,
+        leads TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS saved_replies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        userId INTEGER,
+        keyword TEXT,
+        message TEXT,
+        created TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_status (
+        pageId TEXT PRIMARY KEY,
+        lastSync TEXT,
+        status TEXT,
+        totalLeads INTEGER DEFAULT 0,
+        newLeads INTEGER DEFAULT 0
+    );
+`);
+
+console.log('✅ Database ready!');
 
 // ============================================================
-// AUTH
+// DATABASE HELPER FUNCTIONS
+// ============================================================
+function dbAll(sql, params = []) {
+    const stmt = db.prepare(sql);
+    return stmt.all(...params);
+}
+
+function dbGet(sql, params = []) {
+    const stmt = db.prepare(sql);
+    return stmt.get(...params);
+}
+
+function dbRun(sql, params = []) {
+    const stmt = db.prepare(sql);
+    return stmt.run(...params);
+}
+
+// ============================================================
+// AUTH ROUTES
 // ============================================================
 app.post('/api/auth/signup', (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password) {
         return res.status(400).json({ error: 'All fields are required' });
     }
-    if (users.find(u => u.email === email)) {
-        return res.status(400).json({ error: 'Email already exists' });
+    
+    try {
+        const existing = dbGet('SELECT * FROM users WHERE email = ?', [email]);
+        if (existing) {
+            return res.status(400).json({ error: 'Email already exists' });
+        }
+        
+        dbRun('INSERT INTO users (name, email, password, created) VALUES (?, ?, ?, ?)', 
+            [name, email, password, new Date().toISOString()]);
+        const user = dbGet('SELECT * FROM users WHERE email = ?', [email]);
+        res.json({ success: true, user: { id: user.id, name: user.name, email: user.email } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
-    const user = { id: users.length + 1, name, email, password, created: new Date().toISOString() };
-    users.push(user);
-    res.json({ success: true, user: { id: user.id, name: user.name, email: user.email } });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -61,15 +135,20 @@ app.post('/api/auth/login', (req, res) => {
     if (!email || !password) {
         return res.status(400).json({ error: 'Email and password required' });
     }
-    const user = users.find(u => u.email === email && u.password === password);
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid email or password' });
+    
+    try {
+        const user = dbGet('SELECT * FROM users WHERE email = ? AND password = ?', [email, password]);
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid email or password' });
+        }
+        res.json({ success: true, user: { id: user.id, name: user.name, email: user.email } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
-    res.json({ success: true, user: { id: user.id, name: user.name, email: user.email } });
 });
 
 // ============================================================
-// PAGES
+// PAGES ROUTE
 // ============================================================
 app.get('/api/pages', async (req, res) => {
     try {
@@ -105,7 +184,7 @@ app.get('/api/pages', async (req, res) => {
 });
 
 // ============================================================
-// LEADS
+// LEADS ROUTES
 // ============================================================
 app.get('/api/leads/:pageId', async (req, res) => {
     const { pageId } = req.params;
@@ -160,8 +239,24 @@ app.get('/api/leads/:pageId', async (req, res) => {
             }
         }
 
-        leads = allLeads;
-        res.json({ leads, total: leads.length });
+        // Save to database
+        const insertStmt = db.prepare(`
+            INSERT OR REPLACE INTO leads (pageId, psid, name, lastSync, lastMessage, lastMessageTime) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        `);
+        
+        const insertMany = db.transaction((leads) => {
+            for (const lead of leads) {
+                insertStmt.run(pageId, lead.psid, lead.name, new Date().toISOString(), lead.lastMessage, lead.lastMessageTime);
+            }
+        });
+        insertMany(allLeads);
+
+        dbRun('INSERT OR REPLACE INTO sync_status (pageId, lastSync, status, totalLeads, newLeads) VALUES (?, ?, ?, ?, ?)',
+            [pageId, new Date().toISOString(), 'completed', allLeads.length, 0]);
+
+        const dbLeads = dbAll('SELECT * FROM leads WHERE pageId = ? ORDER BY lastMessageTime DESC', [pageId]);
+        res.json({ leads: dbLeads, total: dbLeads.length });
     } catch (error) {
         console.error('❌ Leads error:', error.message);
         res.status(500).json({ error: error.message });
@@ -169,24 +264,46 @@ app.get('/api/leads/:pageId', async (req, res) => {
 });
 
 // ============================================================
-// GET LEADS (Fast)
+// GET LEADS FROM DATABASE (Fast)
 // ============================================================
 app.get('/api/leads/db/:pageId', (req, res) => {
-    res.json({ leads });
+    const { pageId } = req.params;
+    try {
+        const rows = dbAll('SELECT * FROM leads WHERE pageId = ? ORDER BY lastMessageTime DESC', [pageId]);
+        res.json({ leads: rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
 // SYNC STATUS
 // ============================================================
 app.get('/api/sync/status/:pageId', (req, res) => {
-    res.json({ status: 'idle', totalLeads: leads.length, newLeads: 0 });
+    const { pageId } = req.params;
+    try {
+        const row = dbGet('SELECT * FROM sync_status WHERE pageId = ?', [pageId]);
+        res.json(row || { status: 'idle', totalLeads: 0, newLeads: 0 });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
 // GROUPS
 // ============================================================
 app.get('/api/groups/:pageId', (req, res) => {
-    res.json({ groups });
+    const { pageId } = req.params;
+    try {
+        const rows = dbAll('SELECT * FROM groups WHERE pageId = ?', [pageId]);
+        const groups = rows.map(row => ({
+            ...row,
+            leads: row.leads ? JSON.parse(row.leads) : []
+        }));
+        res.json({ groups });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/groups', (req, res) => {
@@ -194,27 +311,54 @@ app.post('/api/groups', (req, res) => {
     if (!pageId || !groupName) {
         return res.status(400).json({ error: 'pageId and groupName are required' });
     }
-    const group = { id: groups.length + 1, pageId, name: groupName, created: new Date().toISOString(), leads: [] };
-    groups.push(group);
-    res.json({ success: true, group });
+    try {
+        dbRun('INSERT INTO groups (pageId, name, created, leads) VALUES (?, ?, ?, ?)', 
+            [pageId, groupName, new Date().toISOString(), '[]']);
+        const group = dbGet('SELECT * FROM groups WHERE pageId = ? ORDER BY id DESC LIMIT 1', [pageId]);
+        res.json({ success: true, group: { id: group.id, name: group.name, created: group.created, leads: [] } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/groups/add-lead', (req, res) => {
-    const { groupId, leadPsid } = req.body;
-    const group = groups.find(g => g.id === groupId);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
-    if (!group.leads.includes(leadPsid)) {
-        group.leads.push(leadPsid);
+    const { pageId, groupId, leadPsid } = req.body;
+    if (!pageId || !groupId || !leadPsid) {
+        return res.status(400).json({ error: 'Missing required fields' });
     }
-    res.json({ success: true });
+    try {
+        const row = dbGet('SELECT * FROM groups WHERE id = ? AND pageId = ?', [groupId, pageId]);
+        if (!row) {
+            return res.status(404).json({ error: 'Group not found' });
+        }
+        let leads = row.leads ? JSON.parse(row.leads) : [];
+        if (!leads.includes(leadPsid)) {
+            leads.push(leadPsid);
+        }
+        dbRun('UPDATE groups SET leads = ? WHERE id = ?', [JSON.stringify(leads), groupId]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/groups/remove-lead', (req, res) => {
-    const { groupId, leadPsid } = req.body;
-    const group = groups.find(g => g.id === groupId);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
-    group.leads = group.leads.filter(id => id !== leadPsid);
-    res.json({ success: true });
+    const { pageId, groupId, leadPsid } = req.body;
+    if (!pageId || !groupId || !leadPsid) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    try {
+        const row = dbGet('SELECT * FROM groups WHERE id = ? AND pageId = ?', [groupId, pageId]);
+        if (!row) {
+            return res.status(404).json({ error: 'Group not found' });
+        }
+        let leads = row.leads ? JSON.parse(row.leads) : [];
+        leads = leads.filter(id => id !== leadPsid);
+        dbRun('UPDATE groups SET leads = ? WHERE id = ?', [JSON.stringify(leads), groupId]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
@@ -231,6 +375,8 @@ app.post('/api/send-message', async (req, res) => {
         if (!recipientId || !message) {
             return res.status(400).json({ error: 'recipientId and message are required' });
         }
+
+        console.log(`📤 Sending to ${recipientId}: Tag = ${tag || 'NO_TAG'}`);
 
         let payload = {
             recipient: { id: recipientId },
@@ -254,6 +400,9 @@ app.post('/api/send-message', async (req, res) => {
             }
         );
 
+        dbRun('UPDATE leads SET lastMessage = ?, lastMessageTime = ? WHERE pageId = ? AND psid = ?',
+            [message, new Date().toISOString(), pageId, recipientId]);
+
         res.json({ success: true, type: tag || 'standard', data: response.data });
     } catch (error) {
         console.error('❌ Send message error:', error.response?.data || error.message);
@@ -265,56 +414,38 @@ app.post('/api/send-message', async (req, res) => {
 // SAVED REPLIES
 // ============================================================
 app.get('/api/saved-replies', (req, res) => {
-    res.json({ replies: savedReplies });
+    const userId = req.headers['user-id'] || 1;
+    try {
+        const rows = dbAll('SELECT * FROM saved_replies WHERE userId = ? ORDER BY created DESC', [userId]);
+        res.json({ replies: rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/saved-replies', (req, res) => {
     const { keyword, message } = req.body;
+    const userId = req.headers['user-id'] || 1;
     if (!keyword || !message) {
         return res.status(400).json({ error: 'keyword and message are required' });
     }
-    const reply = { id: savedReplies.length + 1, keyword: keyword.toLowerCase(), message, created: new Date().toISOString() };
-    savedReplies.push(reply);
-    res.json({ success: true, reply });
+    try {
+        dbRun('INSERT INTO saved_replies (userId, keyword, message, created) VALUES (?, ?, ?, ?)',
+            [userId, keyword.toLowerCase(), message, new Date().toISOString()]);
+        const reply = dbGet('SELECT * FROM saved_replies WHERE userId = ? ORDER BY id DESC LIMIT 1', [userId]);
+        res.json({ success: true, reply: { id: reply.id, keyword: reply.keyword, message: reply.message } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
 // SERVE FRONTEND FILES
 // ============================================================
-// ✅ Render par frontend folder root mein hai
 const frontendPath = path.join(__dirname, '..', 'frontend');
 console.log(`📁 Serving frontend from: ${frontendPath}`);
-
-// ✅ Serve static files
 app.use(express.static(frontendPath));
 
-// ✅ Serve HTML files directly
-app.get('/login', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'login.html'));
-});
-app.get('/signup', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'signup.html'));
-});
-app.get('/dashboard', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'dashboard.html'));
-});
-app.get('/leads', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'leads.html'));
-});
-app.get('/conversations', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'conversations.html'));
-});
-app.get('/groups', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'groups.html'));
-});
-app.get('/bulk', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'bulk.html'));
-});
-app.get('/connect', (req, res) => {
-    res.sendFile(path.join(frontendPath, 'connect.html'));
-});
-
-// ✅ Root route
 app.get('/', (req, res) => {
     res.sendFile(path.join(frontendPath, 'login.html'));
 });
@@ -323,7 +454,8 @@ app.get('/', (req, res) => {
 // START SERVER
 // ============================================================
 app.listen(PORT, () => {
-    console.log(`🚀 Server is running on http://localhost:${PORT}`);
-    console.log(`📄 Pages loaded: ${PAGES.length}`);
-    console.log(`📁 Serving frontend from: ${frontendPath}`);
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`📄 Pages: ${PAGES.length}`);
+    console.log(`📁 Frontend: ${frontendPath}`);
+    console.log(`✅ Database: ${dbPath}`);
 });
